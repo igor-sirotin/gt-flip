@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GT Flip",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Automatically switches Google Translate target language to the opposite when the input language is detected.",
   "content_scripts": [
     {

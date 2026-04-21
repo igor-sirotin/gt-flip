@@ -1,8 +1,9 @@
 /**
  * GT Flip – content script
  *
- * Monitors Google Translate for the currently detected / selected source
- * language and automatically switches the target language to its pair.
+ * Watches the Google Translate source textarea for input, detects the typed
+ * language via chrome.i18n.detectLanguage(), and automatically switches the
+ * target language to the configured pair's opposite.
  *
  * MVP: hardcoded English ↔ Russian pair.
  * To change the pair, edit the LANGUAGES array below.
@@ -11,13 +12,19 @@
   'use strict';
 
   // ── Configuration ────────────────────────────────────────────────────────────
-  // Each entry needs:
-  //   code  – BCP-47 language code used by Google Translate in the URL (sl=/tl=)
-  //   names – display names as they appear in the GT UI (checked case-insensitively)
+  // code  – BCP-47 language code used by Google Translate in the URL (sl=/tl=)
+  // names – display names as they appear in the GT target-tab UI
   const LANGUAGES = [
     { code: 'en', names: ['English'] },
     { code: 'ru', names: ['Russian', 'Русский'] },
   ];
+
+  // Minimum confidence % from chrome.i18n.detectLanguage to act on a result.
+  // Lower values react faster on short input; higher values reduce false flips.
+  const MIN_CONFIDENCE = 40;
+
+  // Minimum number of characters in the source box before attempting detection.
+  const MIN_TEXT_LENGTH = 4;
 
   // ── Utilities ─────────────────────────────────────────────────────────────────
   function getOpposite(code) {
@@ -31,51 +38,6 @@
 
   function urlParams() {
     return new URLSearchParams(window.location.search);
-  }
-
-  // ── Source-language detection ─────────────────────────────────────────────────
-  //
-  // Google Translate uses role="tablist" / role="tab" for the language selector
-  // strips at the top.  The SOURCE strip is the first tablist; the TARGET strip
-  // is the second.  When "Detect language" is active the tab that was selected
-  // by the user has aria-selected="true" and its label contains the detected
-  // language name (e.g. "Russian - Detected" or just "Russian").
-  //
-  // As a faster first check we also look at the `sl` URL parameter, which GT
-  // sets to the actual language code when the user manually selects one.
-
-  function detectSourceLang() {
-    // 1. URL `sl` parameter (set when user explicitly picks a source language)
-    const sl = urlParams().get('sl');
-    if (sl && sl !== 'auto') {
-      const found = LANGUAGES.find((l) => l.code === sl);
-      if (found) return found;
-    }
-
-    // 2. Source tablist only (always the FIRST [role="tablist"] on the page).
-    //
-    //    We intentionally do NOT do a broad document-wide tab scan — that would
-    //    pick up the TARGET tablist too, causing an infinite flip loop.
-    //
-    //    When "Detect language" is active and GT has auto-detected a language,
-    //    it updates the selected tab's aria-label to something like
-    //    "Russian – Detected".  We therefore check for a language name match
-    //    FIRST, before deciding to skip the tab.  A tab whose label contains
-    //    only "Detect language" (no language name) will simply match nothing
-    //    and we return null — meaning "not yet detected, do nothing".
-    const tabLists = document.querySelectorAll('[role="tablist"]');
-    if (tabLists.length > 0) {
-      const srcTabs = tabLists[0].querySelectorAll('[role="tab"]');
-      for (const tab of srcTabs) {
-        if (tab.getAttribute('aria-selected') !== 'true') continue;
-        const label = (tab.getAttribute('aria-label') ?? '') + ' ' + (tab.textContent ?? '');
-        for (const lang of LANGUAGES) {
-          if (textMatchesLang(label, lang)) return lang;
-        }
-      }
-    }
-
-    return null;
   }
 
   // ── Target-language switching ─────────────────────────────────────────────────
@@ -96,7 +58,7 @@
         if (textMatchesLang(label, lang)) {
           if (tab.getAttribute('aria-selected') !== 'true') {
             tab.click();
-            console.debug('[GT Flip] Clicked target tab:', lang.code);
+            console.log('[GT Flip] Clicked target tab:', lang.code);
           }
           return;
         }
@@ -104,73 +66,101 @@
     }
 
     // 2. Fallback: update the `tl` URL parameter.
-    //    Useful when the desired language is not currently shown in the quick
-    //    tabs (e.g. user has never used it before).  GT reads the URL on mount,
-    //    so a replaceState update takes effect after the next user interaction
-    //    or soft navigation.
     const params = urlParams();
     if (params.get('tl') === lang.code) return;
     params.set('tl', lang.code);
     window.history.replaceState(null, '', `${location.pathname}?${params.toString()}`);
-    console.debug('[GT Flip] Updated URL tl →', lang.code);
+    console.log('[GT Flip] Updated URL tl →', lang.code);
   }
 
-  // ── Core flip logic ───────────────────────────────────────────────────────────
+  // ── Language detection & flip ─────────────────────────────────────────────────
   let lastSourceCode = null;
-  let isSwitching = false; // prevents re-entry while our own click/replaceState mutates the DOM
+  let isSwitching = false;
+  let debounceTimer = null;
 
-  function checkAndFlip() {
-    if (isSwitching) return;
+  function handleDetected({ languages } = {}) {
+    if (isSwitching || !languages?.length) return;
 
-    const src = detectSourceLang();
-    if (!src) return;
-    if (src.code === lastSourceCode) return; // nothing changed
+    // Pick the highest-confidence result that belongs to our configured pair.
+    for (const { language, percentage } of languages) {
+      if (percentage < MIN_CONFIDENCE) continue;
+      const src = LANGUAGES.find((l) => l.code === language);
+      if (!src) continue;
 
-    const target = getOpposite(src.code);
-    if (!target) return;
+      if (src.code === lastSourceCode) return; // no change, nothing to do
 
-    const currentTarget = getCurrentTargetLang();
-    if (currentTarget?.code === target.code) {
-      // Target is already correct – just update our bookkeeping.
+      const target = getOpposite(src.code);
+      if (!target) return;
+
+      const currentTarget = getCurrentTargetLang();
+      if (currentTarget?.code === target.code) {
+        lastSourceCode = src.code; // already correct, just sync bookkeeping
+        return;
+      }
+
+      console.log(`[GT Flip] detected ${src.code} (${percentage}%) → switching target to ${target.code}`);
+      isSwitching = true;
+      setTargetLang(target);
       lastSourceCode = src.code;
+      // Release the guard after GT's own event handlers have settled.
+      setTimeout(() => { isSwitching = false; }, 1500);
+      return; // act only on the first (highest-confidence) match
+    }
+  }
+
+  function scheduleDetection(text) {
+    clearTimeout(debounceTimer);
+
+    if (text.length === 0) {
+      // Input was cleared — reset so the next typing session starts fresh.
+      lastSourceCode = null;
       return;
     }
 
-    console.debug(`[GT Flip] source: ${src.code} → target: ${target.code}`);
-    isSwitching = true;
-    setTargetLang(target);
-    lastSourceCode = src.code;
-    // Release the guard after GT's event handlers have had time to settle.
-    setTimeout(() => { isSwitching = false; }, 1500);
+    if (text.length < MIN_TEXT_LENGTH) return;
+
+    debounceTimer = setTimeout(() => {
+      chrome.i18n.detectLanguage(text, handleDetected);
+    }, 500);
   }
 
-  // ── Observers & polling ───────────────────────────────────────────────────────
-  let debounceTimer = null;
+  // ── Source textarea discovery & attachment ────────────────────────────────────
+  console.log('[GT Flip] content script loaded');
+  //
+  // Google Translate is a SPA — the <textarea> may not exist when the content
+  // script first runs.  We use a MutationObserver to spot it as soon as it
+  // appears, then attach a single 'input' listener.
 
-  function schedule() {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(checkAndFlip, 600);
+  let attachedEl = null;
+
+  function onInput(e) {
+    scheduleDetection((e.target.value ?? '').trim());
   }
 
-  // Watch DOM mutations (language tab changes, re-renders after typing, etc.)
-  const observer = new MutationObserver(schedule);
-  observer.observe(document.documentElement, {
-    subtree: true,
-    childList: true,
-    attributes: true,
-    attributeFilter: ['aria-selected', 'aria-label', 'class'],
-    characterData: true,
-  });
+  function tryAttach() {
+    // If the element we already attached to is still in the DOM, do nothing.
+    if (attachedEl && document.contains(attachedEl)) return;
 
-  // Watch for SPA navigations that change the URL without a full page load
-  let lastHref = location.href;
-  setInterval(() => {
-    if (location.href !== lastHref) {
-      lastHref = location.href;
-      schedule();
+    // Google Translate's source box is the only <textarea> on the page.
+    const el = document.querySelector('textarea');
+    if (!el || el === attachedEl) return;
+
+    if (attachedEl) attachedEl.removeEventListener('input', onInput);
+    attachedEl = el;
+    attachedEl.addEventListener('input', onInput);
+    console.log('[GT Flip] Attached to source textarea');
+
+    // If the textarea already contains text (e.g. loaded from URL), detect now.
+    const existing = attachedEl.value.trim();
+    if (existing.length >= MIN_TEXT_LENGTH) {
+      chrome.i18n.detectLanguage(existing, handleDetected);
     }
-  }, 500);
+  }
 
-  // Run once after the page has settled to handle the initial load state
-  setTimeout(checkAndFlip, 1500);
+  // Watch for DOM changes so we re-attach after SPA navigations.
+  const observer = new MutationObserver(tryAttach);
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+
+  // Also attempt immediately in case the textarea is already in the DOM.
+  setTimeout(tryAttach, 1000);
 })();
