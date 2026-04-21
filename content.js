@@ -52,29 +52,26 @@
       if (found) return found;
     }
 
-    // 2. First tablist → selected tab (covers both manual & auto-detected)
+    // 2. Source tablist only (always the FIRST [role="tablist"] on the page).
+    //
+    //    We intentionally do NOT do a broad document-wide tab scan — that would
+    //    pick up the TARGET tablist too, causing an infinite flip loop.
+    //
+    //    When "Detect language" is active and GT has auto-detected a language,
+    //    it updates the selected tab's aria-label to something like
+    //    "Russian – Detected".  We therefore check for a language name match
+    //    FIRST, before deciding to skip the tab.  A tab whose label contains
+    //    only "Detect language" (no language name) will simply match nothing
+    //    and we return null — meaning "not yet detected, do nothing".
     const tabLists = document.querySelectorAll('[role="tablist"]');
     if (tabLists.length > 0) {
       const srcTabs = tabLists[0].querySelectorAll('[role="tab"]');
       for (const tab of srcTabs) {
         if (tab.getAttribute('aria-selected') !== 'true') continue;
         const label = (tab.getAttribute('aria-label') ?? '') + ' ' + (tab.textContent ?? '');
-        if (/detect/i.test(label)) continue; // Skip the generic "Detect language" placeholder
         for (const lang of LANGUAGES) {
           if (textMatchesLang(label, lang)) return lang;
         }
-      }
-    }
-
-    // 3. Broader scan – Google sometimes renders the detected language in a tab
-    //    that carries "- Detected" in its aria-label even when the tab is not
-    //    part of the canonical first tablist (e.g. after SPA re-renders).
-    const allTabs = document.querySelectorAll('[role="tab"][aria-selected="true"]');
-    for (const tab of allTabs) {
-      const label = (tab.getAttribute('aria-label') ?? '') + ' ' + (tab.textContent ?? '');
-      if (/detect/i.test(label)) continue;
-      for (const lang of LANGUAGES) {
-        if (textMatchesLang(label, lang)) return lang;
       }
     }
 
@@ -120,8 +117,11 @@
 
   // ── Core flip logic ───────────────────────────────────────────────────────────
   let lastSourceCode = null;
+  let isSwitching = false; // prevents re-entry while our own click/replaceState mutates the DOM
 
   function checkAndFlip() {
+    if (isSwitching) return;
+
     const src = detectSourceLang();
     if (!src) return;
     if (src.code === lastSourceCode) return; // nothing changed
@@ -137,8 +137,11 @@
     }
 
     console.debug(`[GT Flip] source: ${src.code} → target: ${target.code}`);
+    isSwitching = true;
     setTargetLang(target);
     lastSourceCode = src.code;
+    // Release the guard after GT's event handlers have had time to settle.
+    setTimeout(() => { isSwitching = false; }, 1500);
   }
 
   // ── Observers & polling ───────────────────────────────────────────────────────
